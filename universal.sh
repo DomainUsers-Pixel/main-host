@@ -325,7 +325,33 @@ EOF
 
     show_loading "Creating administrator account..."
     cd "$SERVER_DIR"
-    sudo -u www-data php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USERNAME" --name-first="$ADMIN_FIRST_NAME" --name-last="$ADMIN_LAST_NAME" --password="$ADMIN_PASSWORD" --admin=1 --no-interaction 2>&1 | tail -n 3
+    
+    # First verify database connection
+    if ! sudo -u www-data php artisan db:show > /dev/null 2>&1; then
+        echo -e "${COLOR_RED}Database connection test failed. Checking configuration...${NC}"
+        # Try to fix common issues
+        sudo systemctl restart mysql
+        sleep 2
+    fi
+    
+    # Create admin user with proper error handling
+    OUTPUT=$(sudo -u www-data php artisan p:user:make \
+        --email="$ADMIN_EMAIL" \
+        --username="$ADMIN_USERNAME" \
+        --name-first="$ADMIN_FIRST_NAME" \
+        --name-last="$ADMIN_LAST_NAME" \
+        --password="$ADMIN_PASSWORD" \
+        --admin=1 \
+        --no-interaction 2>&1)
+    
+    if echo "$OUTPUT" | grep -q "successfully\|created"; then
+        echo -e "${COLOR_GREEN}Admin user created successfully!${NC}"
+    else
+        echo -e "${COLOR_RED}Admin user creation failed. Output:${NC}"
+        echo "$OUTPUT" | tail -n 5
+        echo -e "\n${COLOR_YELLOW}You can create the admin manually later with:${NC}"
+        echo -e "${COLOR_CYAN}cd ${SERVER_DIR} && php artisan p:user:make${NC}"
+    fi
     
     echo -e "\n${COLOR_GREEN}Pterodactyl Panel Installation Complete!${NC}"
     echo -e "${COLOR_CYAN}   Access your panel at: http://${PANEL_HOST}${NC}"
@@ -572,7 +598,635 @@ EOF
 }
 
 # ===============================================
-# === 7. Change Theme ===
+# === 7. RDP/VNC Setup ===
+# ===============================================
+install_rdp_vnc() {
+    detect_os || return
+
+    title_echo "RDP/VNC REMOTE DESKTOP SETUP"
+    
+    echo -e "\n${COLOR_CYAN}--- Remote Desktop Configuration ---${NC}"
+    echo -e "  1. Install Desktop Environment (Current OS)"
+    echo -e "  2. Install New OS in Container (QEMU/KVM)"
+    echo -e "  3. ${COLOR_PURPLE}Install Windows (QEMU/KVM)${NC}"
+    echo -e "  4. Back to Main Menu"
+    
+    read -p "Enter your choice (1-4): " RDP_MAIN_CHOICE
+    
+    case $RDP_MAIN_CHOICE in
+        1) install_desktop_environment ;;
+        2) install_os_container ;;
+        3) install_windows_vm ;;
+        4) return ;;
+        *) echo -e "${COLOR_RED}Invalid choice.${NC}"; return ;;
+    esac
+}
+
+# Desktop Environment Installation for Current OS
+install_desktop_environment() {
+    title_echo "DESKTOP ENVIRONMENT INSTALLATION"
+    
+    echo -e "\n${COLOR_CYAN}--- Available Desktop Environments ---${NC}"
+    echo -e "  1. XFCE (Lightweight)"
+    echo -e "  2. LXDE (Ultra Lightweight)"
+    echo -e "  3. GNOME (Full Featured)"
+    echo -e "  4. KDE Plasma (Modern)"
+    echo -e "  5. MATE (Traditional)"
+    echo -e "  6. Cinnamon (Elegant)"
+    echo -e "  7. Cancel"
+    
+    read -p "Select Desktop Environment (1-7): " DE_CHOICE
+    
+    local DE_NAME=""
+    local DE_PACKAGE=""
+    
+    case $DE_CHOICE in
+        1) DE_NAME="XFCE"; DE_PACKAGE="xfce4 xfce4-goodies" ;;
+        2) DE_NAME="LXDE"; DE_PACKAGE="lxde-core lxde" ;;
+        3) DE_NAME="GNOME"; DE_PACKAGE="ubuntu-desktop" ;;
+        4) DE_NAME="KDE Plasma"; DE_PACKAGE="kubuntu-desktop" ;;
+        5) DE_NAME="MATE"; DE_PACKAGE="ubuntu-mate-desktop" ;;
+        6) DE_NAME="Cinnamon"; DE_PACKAGE="cinnamon-desktop-environment" ;;
+        7) return ;;
+        *) echo -e "${COLOR_RED}Invalid choice.${NC}"; return ;;
+    esac
+    
+    echo -e "\n${COLOR_CYAN}--- Remote Access Protocol ---${NC}"
+    echo -e "  1. RDP (xRDP - Windows Remote Desktop Compatible)"
+    echo -e "  2. VNC (TigerVNC - Universal VNC Protocol)"
+    echo -e "  3. Both RDP and VNC"
+    echo -e "  4. Cancel"
+    
+    read -p "Select Protocol (1-4): " PROTOCOL_CHOICE
+    
+    case $PROTOCOL_CHOICE in
+        1) PROTOCOL="RDP" ;;
+        2) PROTOCOL="VNC" ;;
+        3) PROTOCOL="BOTH" ;;
+        4) return ;;
+        *) echo -e "${COLOR_RED}Invalid choice.${NC}"; return ;;
+    esac
+    
+    # Installation
+    show_loading "Installing ${DE_NAME} Desktop Environment..."
+    
+    if [ "$PACKAGE_MANAGER" = "apt" ]; then
+        sudo apt update > /dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive sudo apt install -y $DE_PACKAGE > /dev/null 2>&1
+        
+        if [ $? -ne 0 ]; then
+            echo -e "${COLOR_RED}Failed to install ${DE_NAME}.${NC}"
+            return
+        fi
+        
+        echo -e "${COLOR_GREEN}${DE_NAME} installed successfully.${NC}"
+        
+        # Install Remote Access
+        if [ "$PROTOCOL" = "RDP" ] || [ "$PROTOCOL" = "BOTH" ]; then
+            show_loading "Installing xRDP..."
+            sudo apt install -y xrdp > /dev/null 2>&1
+            
+            # Configure xRDP
+            sudo systemctl enable xrdp > /dev/null 2>&1
+            sudo systemctl start xrdp
+            
+            # Allow RDP through firewall if UFW is active
+            if sudo ufw status | grep -q "active"; then
+                sudo ufw allow 3389/tcp > /dev/null 2>&1
+            fi
+            
+            echo -e "${COLOR_GREEN}xRDP installed and running on port 3389.${NC}"
+        fi
+        
+        if [ "$PROTOCOL" = "VNC" ] || [ "$PROTOCOL" = "BOTH" ]; then
+            show_loading "Installing TigerVNC..."
+            sudo apt install -y tigervnc-standalone-server tigervnc-common > /dev/null 2>&1
+            
+            # Setup VNC
+            echo -e "\n${COLOR_CYAN}--- VNC Password Setup ---${NC}"
+            read -s -p "Enter VNC Password (6-8 characters): " VNC_PASS
+            echo
+            
+            mkdir -p ~/.vnc
+            echo "$VNC_PASS" | vncpasswd -f > ~/.vnc/passwd
+            chmod 600 ~/.vnc/passwd
+            
+            # Create VNC startup script
+            cat > ~/.vnc/xstartup << 'VNCEOF'
+#!/bin/bash
+xrdb $HOME/.Xresources
+startxfce4 &
+VNCEOF
+            chmod +x ~/.vnc/xstartup
+            
+            # Start VNC server
+            vncserver :1 -geometry 1920x1080 -depth 24 > /dev/null 2>&1
+            
+            # Allow VNC through firewall
+            if sudo ufw status | grep -q "active"; then
+                sudo ufw allow 5901/tcp > /dev/null 2>&1
+            fi
+            
+            echo -e "${COLOR_GREEN}TigerVNC installed and running on port 5901.${NC}"
+        fi
+        
+    else
+        echo -e "${COLOR_RED}This feature currently only supports Ubuntu/Debian.${NC}"
+        return
+    fi
+    
+    # Display connection info
+    PUBLIC_IP=$(curl -s --max-time 3 ifconfig.me 2>/dev/null || echo "your-server-ip")
+    TS_IP=$(tailscale ip -4 2>/dev/null || echo "tailscale-not-configured")
+    
+    echo -e "\n${COLOR_GREEN}=== Installation Complete! ===${NC}"
+    echo -e "${COLOR_CYAN}Desktop Environment: ${DE_NAME}${NC}"
+    
+    if [ "$PROTOCOL" = "RDP" ] || [ "$PROTOCOL" = "BOTH" ]; then
+        echo -e "\n${COLOR_YELLOW}--- RDP Connection Info ---${NC}"
+        echo -e "${COLOR_CYAN}  Protocol: RDP (Remote Desktop)${NC}"
+        echo -e "${COLOR_CYAN}  Port: 3389${NC}"
+        echo -e "${COLOR_CYAN}  Public IP: ${PUBLIC_IP}:3389${NC}"
+        echo -e "${COLOR_CYAN}  Tailscale IP: ${TS_IP}:3389${NC}"
+        echo -e "${COLOR_YELLOW}  Windows: Use 'Remote Desktop Connection'${NC}"
+        echo -e "${COLOR_YELLOW}  Linux: Use 'rdesktop' or 'xfreerdp'${NC}"
+    fi
+    
+    if [ "$PROTOCOL" = "VNC" ] || [ "$PROTOCOL" = "BOTH" ]; then
+        echo -e "\n${COLOR_YELLOW}--- VNC Connection Info ---${NC}"
+        echo -e "${COLOR_CYAN}  Protocol: VNC${NC}"
+        echo -e "${COLOR_CYAN}  Port: 5901${NC}"
+        echo -e "${COLOR_CYAN}  Public IP: ${PUBLIC_IP}:5901${NC}"
+        echo -e "${COLOR_CYAN}  Tailscale IP: ${TS_IP}:5901${NC}"
+        echo -e "${COLOR_YELLOW}  Use VNC Viewer (TightVNC, RealVNC, etc.)${NC}"
+        echo -e "${COLOR_YELLOW}  VNC Display: :1${NC}"
+    fi
+    
+    echo -e "\n${COLOR_GREEN}TIP: Use Tailscale IP for secure access!${NC}"
+}
+
+# OS Container Installation (QEMU/KVM)
+install_os_container() {
+    title_echo "VIRTUAL OS INSTALLATION (QEMU/KVM)"
+    
+    echo -e "\n${COLOR_CYAN}--- Available Operating Systems ---${NC}"
+    echo -e "  1. Debian 12 (Stable)"
+    echo -e "  2. Ubuntu 22.04 LTS"
+    echo -e "  3. Arch Linux (Latest)"
+    echo -e "  4. Kali Linux (Latest)"
+    echo -e "  5. Fedora (Latest)"
+    echo -e "  6. Alpine Linux (Lightweight)"
+    echo -e "  7. Cancel"
+    
+    read -p "Select OS to install (1-7): " OS_CHOICE
+    
+    local OS_NAME=""
+    local ISO_URL=""
+    
+    case $OS_CHOICE in
+        1) 
+            OS_NAME="Debian 12"
+            ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.5.0-amd64-netinst.iso"
+            ;;
+        2) 
+            OS_NAME="Ubuntu 22.04"
+            ISO_URL="https://releases.ubuntu.com/22.04/ubuntu-22.04.3-live-server-amd64.iso"
+            ;;
+        3) 
+            OS_NAME="Arch Linux"
+            ISO_URL="https://mirror.rackspace.com/archlinux/iso/latest/archlinux-x86_64.iso"
+            ;;
+        4) 
+            OS_NAME="Kali Linux"
+            ISO_URL="https://cdimage.kali.org/kali-2024.1/kali-linux-2024.1-installer-amd64.iso"
+            ;;
+        5) 
+            OS_NAME="Fedora"
+            ISO_URL="https://download.fedoraproject.org/pub/fedora/linux/releases/39/Server/x86_64/iso/Fedora-Server-netinst-x86_64-39-1.5.iso"
+            ;;
+        6) 
+            OS_NAME="Alpine Linux"
+            ISO_URL="https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-3.19.1-x86_64.iso"
+            ;;
+        7) return ;;
+        *) echo -e "${COLOR_RED}Invalid choice.${NC}"; return ;;
+    esac
+    
+    echo -e "\n${COLOR_CYAN}--- VM Configuration ---${NC}"
+    read -p "VM Name (e.g., myvm): " VM_NAME
+    read -p "RAM in GB (e.g., 2, 4, 8): " VM_RAM
+    read -p "Disk Size in GB (e.g., 20, 40, 80): " VM_DISK
+    read -p "CPU Cores (e.g., 2, 4): " VM_CPU
+    
+    VM_NAME=${VM_NAME:-myvm}
+    VM_RAM=${VM_RAM:-2}
+    VM_DISK=${VM_DISK:-20}
+    VM_CPU=${VM_CPU:-2}
+    
+    # Install QEMU/KVM
+    show_loading "Installing QEMU/KVM virtualization..."
+    
+    if [ "$PACKAGE_MANAGER" = "apt" ]; then
+        sudo apt update > /dev/null 2>&1
+        sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virt-manager > /dev/null 2>&1
+        
+        if [ $? -ne 0 ]; then
+            echo -e "${COLOR_RED}Failed to install QEMU/KVM.${NC}"
+            return
+        fi
+        
+        sudo systemctl enable libvirtd > /dev/null 2>&1
+        sudo systemctl start libvirtd
+        sudo usermod -aG libvirt $(whoami) > /dev/null 2>&1
+        sudo usermod -aG kvm $(whoami) > /dev/null 2>&1
+        
+        echo -e "${COLOR_GREEN}QEMU/KVM installed successfully.${NC}"
+    else
+        echo -e "${COLOR_RED}This feature currently only supports Ubuntu/Debian.${NC}"
+        return
+    fi
+    
+    # Create VM directory
+    VM_DIR="/var/lib/libvirt/images"
+    sudo mkdir -p "$VM_DIR"
+    
+    # Download ISO
+    show_loading "Downloading ${OS_NAME} ISO (this may take several minutes)..."
+    ISO_FILE="${VM_DIR}/${VM_NAME}.iso"
+    sudo curl -L "$ISO_URL" -o "$ISO_FILE" 2>&1 | grep -oP '\d+%' | tail -1
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${COLOR_RED}Failed to download ISO.${NC}"
+        return
+    fi
+    
+    echo -e "${COLOR_GREEN}ISO downloaded successfully.${NC}"
+    
+    # Create virtual disk
+    show_loading "Creating virtual disk (${VM_DISK}GB)..."
+    DISK_FILE="${VM_DIR}/${VM_NAME}.qcow2"
+    sudo qemu-img create -f qcow2 "$DISK_FILE" ${VM_DISK}G > /dev/null 2>&1
+    
+    echo -e "${COLOR_GREEN}Virtual disk created.${NC}"
+    
+    # Create VM
+    show_loading "Creating virtual machine..."
+    
+    sudo virt-install \
+        --name "$VM_NAME" \
+        --ram $((VM_RAM * 1024)) \
+        --vcpus "$VM_CPU" \
+        --disk path="$DISK_FILE",format=qcow2 \
+        --cdrom "$ISO_FILE" \
+        --os-variant generic \
+        --network network=default \
+        --graphics vnc,listen=0.0.0.0,port=5902 \
+        --noautoconsole > /dev/null 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${COLOR_RED}Failed to create VM.${NC}"
+        return
+    fi
+    
+    PUBLIC_IP=$(curl -s --max-time 3 ifconfig.me 2>/dev/null || echo "your-server-ip")
+    TS_IP=$(tailscale ip -4 2>/dev/null || echo "tailscale-not-configured")
+    
+    echo -e "\n${COLOR_GREEN}=== Virtual Machine Created Successfully! ===${NC}"
+    echo -e "${COLOR_CYAN}VM Name: ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}OS: ${OS_NAME}${NC}"
+    echo -e "${COLOR_CYAN}RAM: ${VM_RAM}GB${NC}"
+    echo -e "${COLOR_CYAN}Disk: ${VM_DISK}GB${NC}"
+    echo -e "${COLOR_CYAN}CPUs: ${VM_CPU}${NC}"
+    
+    echo -e "\n${COLOR_YELLOW}--- VNC Access (for OS installation) ---${NC}"
+    echo -e "${COLOR_CYAN}  Port: 5902${NC}"
+    echo -e "${COLOR_CYAN}  Public IP: ${PUBLIC_IP}:5902${NC}"
+    echo -e "${COLOR_CYAN}  Tailscale IP: ${TS_IP}:5902${NC}"
+    echo -e "${COLOR_YELLOW}  Use VNC Viewer to connect and complete OS installation${NC}"
+    
+    echo -e "\n${COLOR_YELLOW}--- VM Management Commands ---${NC}"
+    echo -e "${COLOR_CYAN}  Start VM: sudo virsh start ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  Stop VM: sudo virsh shutdown ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  Delete VM: sudo virsh undefine ${VM_NAME} --remove-all-storage${NC}"
+    echo -e "${COLOR_CYAN}  List VMs: sudo virsh list --all${NC}"
+}
+
+# Windows VM Installation (QEMU/KVM with RDP)
+install_windows_vm() {
+    title_echo "WINDOWS VIRTUAL MACHINE INSTALLATION"
+    
+    echo -e "\n${COLOR_PURPLE}╔════════════════════════════════════════╗${NC}"
+    echo -e "${COLOR_PURPLE}║   🪟  MAGICAL WINDOWS INSTALLER  🪟   ║${NC}"
+    echo -e "${COLOR_PURPLE}╚════════════════════════════════════════╝${NC}\n"
+    
+    echo -e "${COLOR_CYAN}--- Available Windows Versions ---${NC}"
+    echo -e "  1. ${COLOR_BLUE}Windows 11${NC} (Latest, Modern UI)"
+    echo -e "  2. ${COLOR_BLUE}Windows 10${NC} (Stable, Popular)"
+    echo -e "  3. ${COLOR_BLUE}Windows 7${NC} (Classic Aero Theme)"
+    echo -e "  4. ${COLOR_BLUE}Windows XP${NC} (Retro, Nostalgia)"
+    echo -e "  5. Cancel"
+    
+    read -p "Select Windows Version (1-5): " WIN_CHOICE
+    
+    local WIN_NAME=""
+    local ISO_URL=""
+    local WIN_VERSION=""
+    local RECOMMENDED_RAM=""
+    local RECOMMENDED_DISK=""
+    
+    case $WIN_CHOICE in
+        1) 
+            WIN_NAME="Windows 11"
+            WIN_VERSION="win11"
+            RECOMMENDED_RAM="4"
+            RECOMMENDED_DISK="64"
+            echo -e "\n${COLOR_YELLOW}Note: Windows 11 requires TPM 2.0 (will be configured automatically)${NC}"
+            ISO_URL="MANUAL"
+            ;;
+        2) 
+            WIN_NAME="Windows 10"
+            WIN_VERSION="win10"
+            RECOMMENDED_RAM="4"
+            RECOMMENDED_DISK="64"
+            ISO_URL="MANUAL"
+            ;;
+        3) 
+            WIN_NAME="Windows 7"
+            WIN_VERSION="win7"
+            RECOMMENDED_RAM="2"
+            RECOMMENDED_DISK="32"
+            echo -e "\n${COLOR_CYAN}✨ Classic Aero theme will be enabled!${NC}"
+            ISO_URL="MANUAL"
+            ;;
+        4) 
+            WIN_NAME="Windows XP"
+            WIN_VERSION="winxp"
+            RECOMMENDED_RAM="1"
+            RECOMMENDED_DISK="16"
+            echo -e "\n${COLOR_CYAN}🎮 Retro nostalgia mode activated!${NC}"
+            ISO_URL="MANUAL"
+            ;;
+        5) return ;;
+        *) echo -e "${COLOR_RED}Invalid choice.${NC}"; return ;;
+    esac
+    
+    echo -e "\n${COLOR_CYAN}--- VM Configuration ---${NC}"
+    read -p "VM Name (default: ${WIN_VERSION}-vm): " VM_NAME
+    VM_NAME=${VM_NAME:-"${WIN_VERSION}-vm"}
+    
+    echo -e "${COLOR_YELLOW}Recommended: ${RECOMMENDED_RAM}GB RAM, ${RECOMMENDED_DISK}GB Disk${NC}"
+    read -p "RAM in GB (default: ${RECOMMENDED_RAM}): " VM_RAM
+    read -p "Disk Size in GB (default: ${RECOMMENDED_DISK}): " VM_DISK
+    read -p "CPU Cores (default: 2): " VM_CPU
+    
+    VM_RAM=${VM_RAM:-$RECOMMENDED_RAM}
+    VM_DISK=${VM_DISK:-$RECOMMENDED_DISK}
+    VM_CPU=${VM_CPU:-2}
+    
+    echo -e "\n${COLOR_CYAN}--- Windows ISO Source ---${NC}"
+    echo -e "  1. Provide ISO URL (download automatically)"
+    echo -e "  2. Use local ISO file path"
+    echo -e "  3. Download from Microsoft (manual browser download)"
+    
+    read -p "Select ISO source (1-3): " ISO_SOURCE
+    
+    local ISO_FILE=""
+    
+    case $ISO_SOURCE in
+        1)
+            read -p "Enter Windows ISO URL: " ISO_URL
+            ;;
+        2)
+            read -p "Enter full path to ISO file: " ISO_FILE
+            if [ ! -f "$ISO_FILE" ]; then
+                echo -e "${COLOR_RED}ISO file not found!${NC}"
+                return
+            fi
+            ;;
+        3)
+            echo -e "\n${COLOR_YELLOW}=== Manual Download Instructions ===${NC}"
+            echo -e "${COLOR_CYAN}1. Visit: https://www.microsoft.com/software-download/${NC}"
+            echo -e "${COLOR_CYAN}2. Download ${WIN_NAME} ISO${NC}"
+            echo -e "${COLOR_CYAN}3. Upload to server or provide direct link${NC}"
+            read -p "Press Enter when ready to continue with ISO path: "
+            read -p "Enter full path to downloaded ISO: " ISO_FILE
+            if [ ! -f "$ISO_FILE" ]; then
+                echo -e "${COLOR_RED}ISO file not found!${NC}"
+                return
+            fi
+            ;;
+        *)
+            echo -e "${COLOR_RED}Invalid choice.${NC}"
+            return
+            ;;
+    esac
+    
+    # Install QEMU/KVM if not already installed
+    show_loading "Checking virtualization support..."
+    
+    if ! command -v qemu-system-x86_64 &> /dev/null; then
+        show_loading "Installing QEMU/KVM with Windows optimization..."
+        
+        if [ "$PACKAGE_MANAGER" = "apt" ]; then
+            sudo apt update > /dev/null 2>&1
+            sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils \
+                virt-manager virtinst qemu-utils ovmf swtpm swtpm-tools > /dev/null 2>&1
+            
+            if [ $? -ne 0 ]; then
+                echo -e "${COLOR_RED}Failed to install QEMU/KVM.${NC}"
+                return
+            fi
+            
+            sudo systemctl enable libvirtd > /dev/null 2>&1
+            sudo systemctl start libvirtd
+            sudo usermod -aG libvirt $(whoami) > /dev/null 2>&1
+            sudo usermod -aG kvm $(whoami) > /dev/null 2>&1
+            
+            echo -e "${COLOR_GREEN}QEMU/KVM installed with Windows support.${NC}"
+        else
+            echo -e "${COLOR_RED}This feature currently only supports Ubuntu/Debian.${NC}"
+            return
+        fi
+    else
+        echo -e "${COLOR_GREEN}Virtualization ready.${NC}"
+    fi
+    
+    # Download virtio drivers for Windows
+    show_loading "Downloading Windows VirtIO drivers..."
+    VIRTIO_ISO="/var/lib/libvirt/images/virtio-win.iso"
+    if [ ! -f "$VIRTIO_ISO" ]; then
+        sudo curl -L "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso" \
+            -o "$VIRTIO_ISO" 2>&1 | grep -oP '\d+%' | tail -1
+        echo -e "${COLOR_GREEN}VirtIO drivers downloaded.${NC}"
+    else
+        echo -e "${COLOR_GREEN}VirtIO drivers already present.${NC}"
+    fi
+    
+    # Create VM directory
+    VM_DIR="/var/lib/libvirt/images"
+    sudo mkdir -p "$VM_DIR"
+    
+    # Download or copy ISO
+    if [ "$ISO_SOURCE" = "1" ]; then
+        show_loading "Downloading ${WIN_NAME} ISO (this may take 30+ minutes)..."
+        ISO_FILE="${VM_DIR}/${VM_NAME}.iso"
+        
+        # Use wget with progress bar for large files
+        sudo wget --progress=bar:force "$ISO_URL" -O "$ISO_FILE" 2>&1 | \
+            grep --line-buffered "%" | \
+            sed -u -e "s/\.//g" | \
+            awk '{printf("\r%s", $2)}'
+        echo
+        
+        if [ $? -ne 0 ] || [ ! -f "$ISO_FILE" ]; then
+            echo -e "${COLOR_RED}Failed to download ISO.${NC}"
+            return
+        fi
+        
+        echo -e "${COLOR_GREEN}ISO downloaded successfully.${NC}"
+    else
+        # Copy local ISO to VM directory
+        show_loading "Copying ISO to VM directory..."
+        sudo cp "$ISO_FILE" "${VM_DIR}/${VM_NAME}.iso"
+        ISO_FILE="${VM_DIR}/${VM_NAME}.iso"
+        echo -e "${COLOR_GREEN}ISO ready.${NC}"
+    fi
+    
+    # Create virtual disk with optimized settings
+    show_loading "Creating virtual disk (${VM_DISK}GB) with Windows optimization..."
+    DISK_FILE="${VM_DIR}/${VM_NAME}.qcow2"
+    sudo qemu-img create -f qcow2 -o preallocation=metadata "$DISK_FILE" ${VM_DISK}G > /dev/null 2>&1
+    
+    echo -e "${COLOR_GREEN}Virtual disk created.${NC}"
+    
+    # Create TPM storage for Windows 11
+    TPM_DIR="/var/lib/libvirt/swtpm/${VM_NAME}"
+    if [ "$WIN_VERSION" = "win11" ]; then
+        show_loading "Configuring TPM 2.0 for Windows 11..."
+        sudo mkdir -p "$TPM_DIR"
+        sudo chown -R libvirt-qemu:kvm "$TPM_DIR"
+        echo -e "${COLOR_GREEN}TPM 2.0 configured.${NC}"
+    fi
+    
+    # Assign VNC port (increment from 5902)
+    VNC_PORT=5903
+    
+    # Build virt-install command based on Windows version
+    show_loading "Creating ${WIN_NAME} virtual machine..."
+    
+    VIRT_INSTALL_CMD="sudo virt-install \
+        --name \"$VM_NAME\" \
+        --ram $((VM_RAM * 1024)) \
+        --vcpus $VM_CPU \
+        --cpu host-passthrough \
+        --disk path=\"$DISK_FILE\",format=qcow2,bus=virtio,cache=writeback \
+        --cdrom \"$ISO_FILE\" \
+        --disk path=\"$VIRTIO_ISO\",device=cdrom \
+        --os-variant ${WIN_VERSION} \
+        --network network=default,model=virtio \
+        --graphics vnc,listen=0.0.0.0,port=$VNC_PORT \
+        --video qxl \
+        --channel spicevmc \
+        --boot uefi"
+    
+    # Add TPM for Windows 11
+    if [ "$WIN_VERSION" = "win11" ]; then
+        VIRT_INSTALL_CMD="$VIRT_INSTALL_CMD --tpm backend.type=emulator,backend.version=2.0,model=tpm-crb"
+    fi
+    
+    VIRT_INSTALL_CMD="$VIRT_INSTALL_CMD --noautoconsole"
+    
+    # Execute installation
+    eval $VIRT_INSTALL_CMD > /dev/null 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${COLOR_RED}Failed to create VM. Check logs: sudo journalctl -xe${NC}"
+        return
+    fi
+    
+    # Get network info
+    PUBLIC_IP=$(curl -s --max-time 3 ifconfig.me 2>/dev/null || echo "your-server-ip")
+    TS_IP=$(tailscale ip -4 2>/dev/null || echo "tailscale-not-configured")
+    
+    # Create RDP setup script for after Windows installation
+    SETUP_SCRIPT="/tmp/${VM_NAME}_rdp_setup.txt"
+    cat > "$SETUP_SCRIPT" << 'RDPEOF'
+=== POST-INSTALLATION RDP SETUP ===
+
+After Windows installation completes, run these commands IN WINDOWS:
+
+1. Enable Remote Desktop:
+   - Open: Settings > System > Remote Desktop
+   - Toggle "Enable Remote Desktop" to ON
+   
+   OR via PowerShell (Run as Administrator):
+   Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
+   Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+2. Configure Network:
+   - The VM will get an IP from libvirt NAT (usually 192.168.122.x)
+   - Check IP in Windows: ipconfig
+   
+3. Port Forwarding for RDP (Run on Linux host):
+   sudo iptables -t nat -A PREROUTING -p tcp --dport 3390 -j DNAT --to-destination [WINDOWS_VM_IP]:3389
+   sudo iptables -A FORWARD -p tcp -d [WINDOWS_VM_IP] --dport 3389 -j ACCEPT
+
+4. Connect via RDP:
+   - Host: your-server-ip:3390
+   - Or: tailscale-ip:3390
+   - Username: Your Windows username
+   - Password: Your Windows password
+
+RDPEOF
+    
+    echo -e "\n${COLOR_PURPLE}╔════════════════════════════════════════╗${NC}"
+    echo -e "${COLOR_PURPLE}║   🎉 WINDOWS VM CREATED SUCCESSFULLY!   ║${NC}"
+    echo -e "${COLOR_PURPLE}╚════════════════════════════════════════╝${NC}\n"
+    
+    echo -e "${COLOR_GREEN}VM Configuration:${NC}"
+    echo -e "${COLOR_CYAN}  VM Name: ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  Windows Version: ${WIN_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  RAM: ${VM_RAM}GB${NC}"
+    echo -e "${COLOR_CYAN}  Disk: ${VM_DISK}GB${NC}"
+    echo -e "${COLOR_CYAN}  CPUs: ${VM_CPU}${NC}"
+    
+    echo -e "\n${COLOR_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${COLOR_YELLOW}  STEP 1: INSTALL WINDOWS VIA VNC${NC}"
+    echo -e "${COLOR_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${COLOR_CYAN}  VNC Port: ${VNC_PORT}${NC}"
+    echo -e "${COLOR_CYAN}  Public IP: ${PUBLIC_IP}:${VNC_PORT}${NC}"
+    echo -e "${COLOR_CYAN}  Tailscale IP: ${TS_IP}:${VNC_PORT}${NC}"
+    echo -e "${COLOR_GREEN}  Use any VNC Viewer to connect and install Windows${NC}"
+    
+    echo -e "\n${COLOR_PURPLE}  📌 IMPORTANT: Install VirtIO drivers during setup!${NC}"
+    echo -e "${COLOR_CYAN}     - When asked for disk, click 'Load Driver'${NC}"
+    echo -e "${COLOR_CYAN}     - Browse to CD Drive (virtio-win)${NC}"
+    echo -e "${COLOR_CYAN}     - Select: viostor > ${WIN_VERSION} > amd64${NC}"
+    echo -e "${COLOR_CYAN}     - Also install: NetKVM for network${NC}"
+    
+    echo -e "\n${COLOR_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${COLOR_YELLOW}  STEP 2: ENABLE RDP AFTER INSTALLATION${NC}"
+    echo -e "${COLOR_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${COLOR_CYAN}  Full instructions saved to: ${SETUP_SCRIPT}${NC}"
+    echo -e "${COLOR_GREEN}  cat ${SETUP_SCRIPT}${NC}"
+    
+    echo -e "\n${COLOR_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${COLOR_YELLOW}  VM MANAGEMENT COMMANDS${NC}"
+    echo -e "${COLOR_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${COLOR_CYAN}  Start VM: sudo virsh start ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  Stop VM: sudo virsh shutdown ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  Force Stop: sudo virsh destroy ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  VM Console: sudo virsh console ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  VM Info: sudo virsh dominfo ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  Get VM IP: sudo virsh domifaddr ${VM_NAME}${NC}"
+    echo -e "${COLOR_CYAN}  Delete VM: sudo virsh undefine ${VM_NAME} --remove-all-storage${NC}"
+    
+    echo -e "\n${COLOR_GREEN}🎮 ${WIN_NAME} is now ready for installation via VNC!${NC}"
+    echo -e "${COLOR_PURPLE}✨ After Windows setup, enable RDP and enjoy! ✨${NC}\n"
+}
+
+# ===============================================
+# === 8. Change Theme ===
 # ===============================================
 change_theme() {
     detect_os || return
@@ -790,7 +1444,7 @@ main_menu() {
         clear
         echo -e "${COLOR_CYAN}${ZMC_ART}${NC}"
         echo -e "${COLOR_GREEN}Version: ${SH_VERSION}${NC}"
-        echo -e "${COLOR_CYAN}Author: Claude 🐐 (Anthropic)${NC}\n"
+        echo -e "${COLOR_CYAN}Author: Claude (Anthropic)${NC}\n"
         INITIAL_RUN_COMPLETE="true"
     fi
 
@@ -806,12 +1460,13 @@ main_menu() {
         echo -e "  4. ${COLOR_BLUE}Wings${NC} - Pterodactyl Node Daemon"
         echo -e "  5. ${COLOR_BLUE}BluePrint${NC} - Pterodactyl Extension"
         echo -e "  6. ${COLOR_CYAN}Cloudflare${NC} - Tunnel Setup"
-        echo -e "  7. ${COLOR_CYAN}Change Theme${NC} - Panel Theme"
-        echo -e "  8. ${COLOR_RED}Uninstall${NC} - Remove Components"
-        echo -e "  9. ${COLOR_YELLOW}System Info${NC} - Diagnostics"
+        echo -e "  7. ${COLOR_PURPLE}RDP/VNC${NC} - Remote Desktop Setup"
+        echo -e "  8. ${COLOR_CYAN}Change Theme${NC} - Panel Theme"
+        echo -e "  9. ${COLOR_RED}Uninstall${NC} - Remove Components"
+        echo -e " 10. ${COLOR_YELLOW}System Info${NC} - Diagnostics"
         echo -e "  0. ${COLOR_RED}Exit${NC}\n"
         
-        read -p "Enter your choice (0-9): " main_choice
+        read -p "Enter your choice (0-10): " main_choice
 
         case $main_choice in
             1) clear; update_system; post_execution_pause ;;
@@ -820,15 +1475,16 @@ main_menu() {
             4) clear; install_wings; post_execution_pause ;;
             5) clear; install_blueprint; post_execution_pause ;;
             6) clear; install_cloudflare_tunnel; post_execution_pause ;;
-            7) clear; change_theme; post_execution_pause ;;
-            8) clear; uninstall_components; post_execution_pause ;;
-            9) clear; show_system_info; post_execution_pause ;;
+            7) clear; install_rdp_vnc; post_execution_pause ;;
+            8) clear; change_theme; post_execution_pause ;;
+            9) clear; uninstall_components; post_execution_pause ;;
+            10) clear; show_system_info; post_execution_pause ;;
             0) 
                 title_echo "EXITING INSTALLER"
                 echo -e "${COLOR_CYAN}Thanks for using ${BRANDING}! Goodbye! 👋${NC}"
                 exit 0 
                 ;;
-            *) echo -e "${COLOR_RED}Invalid choice. Please enter 0-9.${NC}" ;;
+            *) echo -e "${COLOR_RED}Invalid choice. Please enter 0-10.${NC}" ;;
         esac
     done
 }
